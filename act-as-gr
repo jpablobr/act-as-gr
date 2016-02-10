@@ -1,0 +1,289 @@
+#!/usr/bin/env ruby
+
+require 'yaml'
+require 'optparse'
+require 'httparty'
+require 'nokogiri'
+require 'reverse_markdown'
+
+module GoodReads
+  class API
+    include HTTParty
+    base_uri 'goodreads.com'
+
+    def initialize
+      @config = GoodReads.config
+    end
+
+    def get_book(book_id)
+      params = {
+        key: @config['auth_key'],
+        user_id: @config['user_id'],
+        book_id: book_id,
+      }
+
+      response = self.class.get('/review/show_by_user_and_book.xml', query: params)
+
+      if response['GoodreadsResponse']
+        response['GoodreadsResponse']['review']
+      else
+        abort "E: #{response}"
+      end
+    end
+
+    def get_books(page, shelf = nil)
+      params = {
+        v: 2,
+        key: @config['auth_key'],
+        id: @config['user_id'],
+        page: page,
+        per_page: 200,
+      }
+
+      # No `shelf` == all the shelves!
+      params.merge!(shelf: shelf) unless shelf.nil?
+
+      response = self.class.get('/review/list.xml', query: params)
+
+      if response['GoodreadsResponse']
+        response['GoodreadsResponse']['reviews']
+      else
+        abort "E: #{response}"
+      end
+    end
+  end
+
+  class Downloader
+    def initialize(options)
+      @client = GoodReads::API.new
+      @config = GoodReads.config(options)
+      move_to_books_directory
+    end
+
+    def download!
+      user_books.each_with_index do |book_id, index|
+        review = @client.get_book(book_id)
+        if review && write_book?(review['book']['title'], review['book']['isbn'])
+
+          file = book_file_name(review['book']['title'], review['book']['isbn'])
+
+          File.open(file, 'a+') do |f|
+            f.write "* #{review['book']['title']}\n"
+            f.write "ISBN: #{review['book']['isbn']}\n"
+            f.write "Author: #{review['book']['authors']['author']['name']}\n"
+            f.write "Date Added: #{review['date_added']}\n"
+            f.write "Shel{f,ves}: #{format_shelves(review['shelves'])}\n"
+            f.write "Goodreads Review Link: #{review['link']}\n"
+            f.write "Goodreads book Link: #{review['book']['link']}\n"
+            f.write "Rating: #{review['rating']}\n"
+            if review['body']
+              f.write "State: published, to-re-review\n"
+              case
+              when @config['text']
+                f.write "\n** Text Review:\n"
+                f.write Nokogiri::HTML(review['body']).text
+              when @config['markdown']
+                f.write "\n\n** Markdown Review:\n"
+                f.write ReverseMarkdown.convert(review['body'])
+              when @config['html']
+                f.write "\n\n** HTML Review:\n"
+                f.write review['body']
+              when !(@config['html'] && @config['html'] && @config['text'])
+                f.write "\n\n** HTML Review:\n"
+                f.write review['body']
+              end
+            else
+              f.write "State: no-review\n"
+            end
+          end
+
+          if @config['verbose']
+            puts "I: (#{index+1}/#{user_books.count}) #{review['book']['title']}"
+          end
+        end
+      end
+    end
+
+    private
+
+    def move_to_books_directory
+      books_path = File.expand_path(@config['books_directory'])
+
+      if File.directory? books_path
+        Dir.chdir books_path
+
+        if @config['verbose']
+          puts "I: Moved to \"#{books_path}\" directory"
+        end
+      else
+        abort "E: #{books_path} doesn't exist."
+      end
+    end
+
+    def write_book?(title, isbn)
+      case
+      when File.exist?(book_file_name(title, isbn)) && @config['overwrite']
+        true
+      when !File.exist?(book_file_name(title, isbn))
+        true
+      else
+        false
+      end
+    end
+
+    def user_books
+      @user_books ||= begin
+        reviews = []
+        if @config['shelves']
+          # API doesn't support a single request with multiple
+          # shelves, hence we're going ... one by one.
+          @config['shelves'].each do |shelf|
+            reviews += get_books_from_api(shelf)
+          end
+        else
+          reviews += get_books_from_api
+        end
+
+        if @config['verbose']
+          puts "I: #{reviews.count} books found in total"
+        end
+        reviews.map { |review| review['book']['id'] }
+      end
+    end
+
+    def get_books_from_api(shelf = nil)
+      initial_request = @client.get_books(1, shelf)
+      reviews_total = initial_request['total'].to_i
+      reviews = initial_request['review']
+
+      (reviews_total / 200).times do |time|
+        reviews += @client.get_books(time + 2, shelf)['review']
+      end
+
+      if @config['verbose']
+        puts "I: #{reviews_total} books found in the \"#{shelf}\" shelf"
+      end
+      reviews
+    end
+
+    def format_shelves(shelves)
+      if shelves['shelf'].is_a? Array
+        shelves['shelf'].map { |shelf| shelf['name'] }.join(', ')
+      else
+        shelves['shelf']['name']
+      end
+    end
+
+    def book_file_name(title, isbn)
+      file_name = title.downcase.strip.tr(' ', '-').gsub(/[^\w-]/, '') + @config['book_extension']
+      file_name = "#{isbn}-#{file_name}" if isbn
+      file_name
+    end
+  end
+
+  class CLI
+    def self.parse_options
+      options = {}
+
+      option_parser = OptionParser.new do |opt|
+        opt.banner = 'Usage: act-as-gr [options]'
+        opt.separator ''
+        opt.separator 'Example: act-as-gr -v -u 9999999 -k YOUR-KEY -s read,to-read,i-want-money'
+        opt.separator ''
+        opt.on_tail('-h', '--help', 'Print this help') {
+          puts(opt)
+          exit
+        }
+        opt.on('-u', '--user_id', 'User ID to download from') { |user_id|
+          options['user_id'] = user_id
+        }
+        opt.on('-k', '--key', 'API key') { |key|
+          options['key'] = key
+        }
+        opt.on('-a', '--all', 'Download all books (all shelves)') {
+          options['all'] = true
+        }
+        opt.on('--html', 'Add a HTML format section of the review body') {
+          options['html'] = true
+        }
+        opt.on('--text', 'Add a Text format section of the review body') {
+          options['text'] = true
+        }
+        opt.on('--markdown', 'Add a Markdown format section of the review body') {
+          options['markdown'] = true
+        }
+        opt.on('--books-directory', 'Directory in which books will be downloaded') { |directory|
+          options['books_directory'] = directory
+        }
+        opt.on('-s', '--shelves x,y,z', Array, 'Books in given shelves') { |shelves|
+          options['shelves'] = shelves
+        }
+        opt.on('-v', '--verbose', 'Run verbosely') {
+          options['verbose'] = true
+        }
+        opt.on('-o', '--overwrite', 'Overwrites books') {
+          options['overwrite'] = true
+        }
+        opt.on('-c', '--write-config-file', 'Creates config file') {
+          options['write_config_file'] = true
+        }
+        opt.separator ''
+      end
+
+      begin
+        ARGV << '-h' if ARGV.empty?
+        option_parser.parse!(ARGV)
+      rescue OptionParser::ParseError => e
+        $stderr.print "Error: #{e}\n"
+        exit
+      end
+
+      if options['write_config_file']
+        GoodReads.create_local_conf_file!
+      else
+        GoodReads::Downloader.new(options).download!
+      end
+    end
+  end
+
+  def self.config(options = {})
+    config_file = "#{ENV['HOME']}/.act-as-gr.yml"
+
+    config = if File.exist?(config_file)
+      YAML.load_file(config_file)
+    else
+      {
+        user_id: 'CHANGEME',
+        auth_key: 'SECRET', # https://www.goodreads.com/api/keys
+        overwrite: false,
+        books_directory: '~/meta-library',
+        book_extension: '.org',
+        markdown: true,
+        html: false,
+        text: false,
+        verbose: true,
+      }
+    end
+
+    config.merge!(options)
+  end
+
+  def self.create_local_conf_file!
+    config_file = "#{ENV['HOME']}/.act-as-gr.yml"
+
+    if File.exist?(config_file)
+      puts "#{config_file} file already exists."
+    else
+      config_settings = config
+      File.open(config_file, 'a+') do |f|
+        config_settings.each { |k,v| f.write "#{k}: #{v}\n" }
+      end
+    end
+  end
+end
+
+# stdout/stderr should not buffer output
+$stdout.sync = true
+$stderr.sync = true
+
+GoodReads::CLI.parse_options
